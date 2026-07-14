@@ -629,16 +629,38 @@ function renderResultStep(blob, filename) {
   });
 }
 
+async function saveImageToDevice(blob, filename) {
+  const file = new File([blob], filename, { type: blob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file] });
+      return true;
+    } catch (err) {
+      if (err && err.name === 'AbortError') return false; // el usuario canceló
+    }
+  }
+  // escritorio / navegadores sin Web Share: descarga normal
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  return false;
+}
+
 function renderResultStepMultiple(items) {
   const withUrls = items.map((it) => ({ ...it, url: URL.createObjectURL(it.blob) }));
-  const rowsHtml = withUrls.map((it, idx) => `
-    <div class="file-row">
-      <div class="thumb icon">${icon('pdf2img')}</div>
-      <div class="info">
-        <div class="n">${it.filename}</div>
-        <div class="s">${bytesToSize(it.blob.size)}</div>
+
+  // se guardan en Recientes automáticamente, ya que ahora se ven en la misma página
+  withUrls.forEach((it) => addRecent({ name: it.filename, size: it.blob.size, url: it.url, tool: state.currentTool }));
+
+  const cardsHtml = withUrls.map((it, idx) => `
+    <div class="image-preview-card">
+      <img src="${it.url}" alt="${it.filename}" data-idx="${idx}">
+      <div class="image-preview-foot">
+        <span>${it.filename} · ${bytesToSize(it.blob.size)}</span>
+        <button class="save-img-btn" data-idx="${idx}">${icon('download')}</button>
       </div>
-      <a class="recent-dl" href="${it.url}" download="${it.filename}" data-idx="${idx}">${icon('download')}</a>
     </div>
   `).join('');
 
@@ -651,34 +673,37 @@ function renderResultStepMultiple(items) {
       <button class="sheet-close" id="sheetCloseBtn">${icon('x')}</button>
     </div>
     <div class="sheet-body">
-      <div class="file-list">${rowsHtml}</div>
-      ${withUrls.length > 1 ? `<button class="primary-btn" id="dlAllBtn">${icon('download')}Descargar todas</button>` : ''}
+      <p class="save-hint">Mantén presionada una imagen para guardarla en tu galería, o usa el botón de guardar.</p>
+      <div class="image-preview-list">${cardsHtml}</div>
+      ${withUrls.length > 1 ? `<button class="primary-btn" id="saveAllBtn">${icon('download')}Guardar todas en la galería</button>` : ''}
       <button class="ghost-btn" id="doneBtn">Hecho</button>
     </div>
   `;
   $('#sheetCloseBtn').addEventListener('click', closeSheet);
   $('#doneBtn').addEventListener('click', closeSheet);
 
-  $$('.recent-dl', sheetContent).forEach((a, idx) => {
-    a.addEventListener('click', () => {
-      addRecent({ name: withUrls[idx].filename, size: withUrls[idx].blob.size, url: withUrls[idx].url, tool: state.currentTool });
-      showToast('Guardado en Recientes');
+  $$('.save-img-btn', sheetContent).forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const it = withUrls[Number(btn.dataset.idx)];
+      saveImageToDevice(it.blob, it.filename);
     });
   });
 
-  const dlAllBtn = $('#dlAllBtn');
-  if (dlAllBtn) {
-    dlAllBtn.addEventListener('click', () => {
-      withUrls.forEach((it, i) => {
+  const saveAllBtn = $('#saveAllBtn');
+  if (saveAllBtn) {
+    saveAllBtn.addEventListener('click', async () => {
+      const files = withUrls.map((it) => new File([it.blob], it.filename, { type: it.blob.type }));
+      if (navigator.canShare && navigator.canShare({ files })) {
+        try { await navigator.share({ files }); return; } catch (err) { /* cae a descarga individual */ }
+      }
+      for (let i = 0; i < withUrls.length; i++) {
         setTimeout(() => {
           const a = document.createElement('a');
-          a.href = it.url;
-          a.download = it.filename;
+          a.href = withUrls[i].url;
+          a.download = withUrls[i].filename;
           a.click();
         }, i * 300);
-      });
-      withUrls.forEach((it) => addRecent({ name: it.filename, size: it.blob.size, url: it.url, tool: state.currentTool }));
-      showToast('Guardado en Recientes');
+      }
     });
   }
 }
@@ -785,10 +810,13 @@ async function openScanner() {
     renderFileList();
   });
   $('#scannerShutter', wrap).addEventListener('click', () => captureScannerFrame(wrap));
+
+  video.addEventListener('loadedmetadata', () => startAutoFrame(wrap), { once: true });
 }
 
 function closeScanner() {
   const wrap = $('#scannerOverlay');
+  stopAutoFrame();
   if (scannerStream) {
     scannerStream.getTracks().forEach((t) => t.stop());
     scannerStream = null;
@@ -798,6 +826,116 @@ function closeScanner() {
     setTimeout(() => wrap.remove(), 260);
   }
   document.body.style.overflow = '';
+}
+
+/* ---- auto-ajuste del marco al tamaño real del documento ----
+   Se analiza el video en vivo a baja resolución buscando la zona
+   clara y rectangular (la hoja) y el marco se anima hacia ese
+   tamaño; si no encuentra nada confiable, usa un marco por defecto. */
+let scannerDetectTimer = null;
+let scannerFrameState = null;
+let scannerDetectCanvas = null;
+
+function detectDocumentRect(video) {
+  const nativeW = video.videoWidth, nativeH = video.videoHeight;
+  if (!nativeW || !nativeH) return null;
+
+  const procW = 160;
+  const procH = Math.max(1, Math.round((procW * nativeH) / nativeW));
+  if (!scannerDetectCanvas) scannerDetectCanvas = document.createElement('canvas');
+  scannerDetectCanvas.width = procW;
+  scannerDetectCanvas.height = procH;
+  const ctx = scannerDetectCanvas.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, procW, procH);
+
+  let data;
+  try {
+    data = ctx.getImageData(0, 0, procW, procH).data;
+  } catch (e) { return null; }
+
+  const colSum = new Float32Array(procW);
+  const rowSum = new Float32Array(procH);
+  for (let y = 0; y < procH; y++) {
+    for (let x = 0; x < procW; x++) {
+      const i = (y * procW + x) * 4;
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      if (lum > 165) { colSum[x] += 1; rowSum[y] += 1; }
+    }
+  }
+
+  const colThresh = procH * 0.35;
+  const rowThresh = procW * 0.35;
+  let left = -1, right = -1, top = -1, bottom = -1;
+  for (let x = 0; x < procW; x++) if (colSum[x] > colThresh) { left = x; break; }
+  for (let x = procW - 1; x >= 0; x--) if (colSum[x] > colThresh) { right = x; break; }
+  for (let y = 0; y < procH; y++) if (rowSum[y] > rowThresh) { top = y; break; }
+  for (let y = procH - 1; y >= 0; y--) if (rowSum[y] > rowThresh) { bottom = y; break; }
+
+  if (left < 0 || right < 0 || top < 0 || bottom < 0) return null;
+  const w = right - left, h = bottom - top;
+  if (w < procW * 0.22 || h < procH * 0.22) return null; // muy chico, poca confianza
+
+  return { x: left / procW, y: top / procH, w: w / procW, h: h / procH };
+}
+
+function startAutoFrame(wrap) {
+  const video = $('#scannerVideo', wrap);
+  const frameEl = $('#scannerFrame', wrap);
+  scannerFrameState = null;
+
+  scannerDetectTimer = setInterval(() => {
+    const contBox = wrap.getBoundingClientRect();
+    const nativeW = video.videoWidth, nativeH = video.videoHeight;
+    if (!nativeW || !nativeH) return;
+
+    const coverScale = Math.max(contBox.width / nativeW, contBox.height / nativeH);
+    const offsetX = (contBox.width - nativeW * coverScale) / 2;
+    const offsetY = (contBox.height - nativeH * coverScale) / 2;
+
+    const det = detectDocumentRect(video);
+    let target;
+    if (det) {
+      target = {
+        left: offsetX + det.x * nativeW * coverScale,
+        top: offsetY + det.y * nativeH * coverScale,
+        width: det.w * nativeW * coverScale,
+        height: det.h * nativeH * coverScale,
+      };
+    } else {
+      const fw = contBox.width * 0.84;
+      const fh = Math.min(contBox.height * 0.64, fw * 1.414);
+      target = {
+        left: (contBox.width - fw) / 2,
+        top: contBox.height * 0.16,
+        width: fw,
+        height: fh,
+      };
+    }
+
+    if (!scannerFrameState) scannerFrameState = { ...target };
+    const L = 0.3;
+    scannerFrameState.left += (target.left - scannerFrameState.left) * L;
+    scannerFrameState.top += (target.top - scannerFrameState.top) * L;
+    scannerFrameState.width += (target.width - scannerFrameState.width) * L;
+    scannerFrameState.height += (target.height - scannerFrameState.height) * L;
+
+    frameEl.style.left = `${scannerFrameState.left}px`;
+    frameEl.style.top = `${scannerFrameState.top}px`;
+    frameEl.style.width = `${scannerFrameState.width}px`;
+    frameEl.style.height = `${scannerFrameState.height}px`;
+    frameEl.style.right = 'auto';
+    frameEl.style.margin = '0';
+    frameEl.style.maxHeight = 'none';
+    frameEl.style.aspectRatio = 'auto';
+  }, 220);
+}
+
+function stopAutoFrame() {
+  if (scannerDetectTimer) {
+    clearInterval(scannerDetectTimer);
+    scannerDetectTimer = null;
+  }
+  scannerFrameState = null;
 }
 
 function captureScannerFrame(wrap) {

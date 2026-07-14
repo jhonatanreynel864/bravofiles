@@ -182,12 +182,12 @@ body{
 .brand{ display:flex; align-items:center; gap: 11px; }
 .brand-mark{
   width: 40px; height:40px; border-radius: 12px;
-  background: linear-gradient(155deg, var(--azure-200), var(--azure-600));
+  overflow: hidden;
   display:flex; align-items:center; justify-content:center;
-  box-shadow: 0 6px 16px -6px rgba(56,189,248,0.55), 0 1px 0 rgba(255,255,255,0.35) inset;
+  box-shadow: 0 6px 16px -6px rgba(56,189,248,0.55);
   flex-shrink:0;
 }
-.brand-mark svg{ width:22px; height:22px; display:block; }
+.brand-mark img{ width:100%; height:100%; object-fit:cover; display:block; }
 .brand-word{
   font-family: var(--font-display);
   font-weight: 800;
@@ -563,6 +563,34 @@ body{
 .result-wrap p{ margin:0 0 20px 0; font-size:12.5px; color: var(--ink-2); }
 .result-actions{ display:flex; flex-direction:column; gap:10px; }
 
+.save-hint{
+  margin:0; text-align:center; font-size:12px; color: var(--ink-2); line-height:1.5;
+}
+.image-preview-list{ display:flex; flex-direction:column; gap:12px; }
+.image-preview-card{
+  border-radius: var(--radius-m);
+  overflow:hidden;
+  background: var(--glass-fill);
+  border: 1px solid var(--glass-border-soft);
+}
+.image-preview-card img{
+  display:block; width:100%; max-height:320px; object-fit:contain;
+  background: #0a0f18;
+}
+.image-preview-foot{
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+  padding: 9px 12px;
+}
+.image-preview-foot span{
+  font-size:11.5px; color: var(--ink-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.save-img-btn{
+  width:32px; height:32px; border-radius:10px; flex-shrink:0; border:none;
+  background: var(--glass-fill-strong); color: var(--azure-200); cursor:pointer;
+  display:flex; align-items:center; justify-content:center;
+}
+.save-img-btn svg{ width:15px; height:15px; }
+
 /* toast */
 .toast{
   position: fixed; left:50%; bottom: calc(96px + env(safe-area-inset-bottom));
@@ -685,26 +713,7 @@ input[type=file]{ display:none; }
   <header class="header">
     <div class="brand">
       <div class="brand-mark">
-        <svg viewBox="0 0 512 512" width="26" height="26">
-          <defs>
-            <linearGradient id="hdrLetter" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stop-color="#eaf7ff" stop-opacity="0.9"/>
-              <stop offset="100%" stop-color="#eaf7ff" stop-opacity="0.55"/>
-            </linearGradient>
-            <linearGradient id="hdrLines" x1="0%" y1="0%" x2="100%" y2="0%">
-              <stop offset="0%" stop-color="#0f8fe0"/>
-              <stop offset="100%" stop-color="#37b6ff"/>
-            </linearGradient>
-          </defs>
-          <path fill="url(#hdrLetter)" d="M158 90h108c64 0 106 34 106 88 0 34-18 58-46 70 34 12 56 40 56 78 0 58-46 96-114 96h-110zM228 152v78h44c30 0 48-16 48-40 0-24-18-38-48-38zM228 292v82h50c32 0 52-16 52-42 0-26-20-40-52-40z"/>
-          <g transform="translate(92,238)">
-            <path fill="#ffffff" d="M14 0H170L206 36V270a14 14 0 0 1-14 14H14a14 14 0 0 1-14-14V14A14 14 0 0 1 14 0Z"/>
-            <path fill="#dcefff" d="M170 0V22a14 14 0 0 0 14 14H206Z"/>
-            <rect x="34" y="82" width="138" height="17" rx="8.5" fill="url(#hdrLines)"/>
-            <rect x="34" y="122" width="138" height="17" rx="8.5" fill="url(#hdrLines)"/>
-            <rect x="34" y="162" width="92" height="17" rx="8.5" fill="url(#hdrLines)"/>
-          </g>
-        </svg>
+        <img src="icons/icon-192.png" alt="BravoFiles" width="40" height="40">
       </div>
       <div class="brand-word">Bravo<b>Files</b></div>
     </div>
