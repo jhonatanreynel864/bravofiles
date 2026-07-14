@@ -69,22 +69,98 @@ function icon(name, extra = '') {
    MOTORES DE CONVERSIÓN — funcionan 100% en el navegador
    ========================================================= */
 
+/* Lee el tag de orientación EXIF de un JPEG (evita fotos "torcidas" o distorsionadas) */
+function getExifOrientation(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const view = new DataView(e.target.result);
+        if (view.getUint16(0, false) !== 0xffd8) return resolve(1);
+        const length = view.byteLength;
+        let offset = 2;
+        while (offset < length - 1) {
+          const marker = view.getUint16(offset, false);
+          offset += 2;
+          if (marker === 0xffe1) {
+            if (view.getUint32(offset + 2, false) !== 0x45786966) return resolve(1);
+            const tiffOffset = offset + 8;
+            const little = view.getUint16(tiffOffset, false) === 0x4949;
+            const firstIfd = view.getUint32(tiffOffset + 4, little);
+            const dirStart = tiffOffset + firstIfd;
+            const entries = view.getUint16(dirStart, little);
+            for (let i = 0; i < entries; i++) {
+              const entryOffset = dirStart + 2 + i * 12;
+              if (view.getUint16(entryOffset, little) === 0x0112) {
+                return resolve(view.getUint16(entryOffset + 8, little));
+              }
+            }
+            return resolve(1);
+          } else if ((marker & 0xff00) !== 0xff00) {
+            break;
+          } else {
+            offset += view.getUint16(offset, false);
+          }
+        }
+      } catch (err) { /* ignore, default orientation */ }
+      resolve(1);
+    };
+    reader.onerror = () => resolve(1);
+    reader.readAsArrayBuffer(file.slice(0, 128 * 1024));
+  });
+}
+
+/* Convierte un File de imagen a un canvas ya orientado correctamente (corrige fotos
+   que salían giradas/estiradas por los metadatos EXIF de la cámara del celular) */
+async function imageFileToCanvas(file) {
+  const dataUrl = await readAsDataURL(file);
+  const img = await loadImage(dataUrl);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+
+  let orientation = 1;
+  if (file.type === 'image/jpeg' || file.type === 'image/jpg' || /\.(jpe?g)$/i.test(file.name || '')) {
+    orientation = await getExifOrientation(file);
+  }
+
+  const swapped = orientation >= 5 && orientation <= 8;
+  const canvas = document.createElement('canvas');
+  canvas.width = swapped ? h : w;
+  canvas.height = swapped ? w : h;
+  const ctx = canvas.getContext('2d');
+
+  switch (orientation) {
+    case 2: ctx.transform(-1, 0, 0, 1, w, 0); break;
+    case 3: ctx.transform(-1, 0, 0, -1, w, h); break;
+    case 4: ctx.transform(1, 0, 0, -1, 0, h); break;
+    case 5: ctx.transform(0, 1, 1, 0, 0, 0); break;
+    case 6: ctx.transform(0, 1, -1, 0, h, 0); break;
+    case 7: ctx.transform(0, -1, -1, 0, h, w); break;
+    case 8: ctx.transform(0, -1, 1, 0, 0, w); break;
+    default: break;
+  }
+  ctx.drawImage(img, 0, 0, w, h);
+  return canvas;
+}
+
 async function imagesToPdf(files, onProgress) {
   const { jsPDF } = window.jspdf;
+  const MAX_EDGE_PT = 1400; // evita páginas gigantes/raras con fotos de 12+ MP
   let doc = null;
   for (let i = 0; i < files.length; i++) {
     onProgress?.(`Añadiendo página ${i + 1} de ${files.length}…`);
-    const dataUrl = await readAsDataURL(files[i]);
-    const img = await loadImage(dataUrl);
-    const isPng = files[i].type === 'image/png';
-    const pageW = img.width * 72 / 96;
-    const pageH = img.height * 72 / 96;
+    const canvas = await imageFileToCanvas(files[i]);
+    const longEdge = Math.max(canvas.width, canvas.height);
+    const scale = longEdge > MAX_EDGE_PT ? MAX_EDGE_PT / longEdge : 1;
+    const pageW = canvas.width * scale;
+    const pageH = canvas.height * scale;
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
     if (!doc) {
       doc = new jsPDF({ unit: 'pt', format: [pageW, pageH] });
     } else {
       doc.addPage([pageW, pageH]);
     }
-    doc.addImage(dataUrl, isPng ? 'PNG' : 'JPEG', 0, 0, pageW, pageH);
+    doc.addImage(dataUrl, 'JPEG', 0, 0, pageW, pageH);
   }
   return doc.output('blob');
 }
@@ -140,22 +216,8 @@ async function pdfToImages(files, onProgress, format = 'png') {
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
   const mime = format === 'png' ? 'image/png' : 'image/jpeg';
   const ext = format === 'png' ? 'png' : 'jpg';
+  const results = [];
 
-  if (pdf.numPages === 1) {
-    onProgress?.('Exportando imagen…');
-    const page = await pdf.getPage(1);
-    const viewport = page.getViewport({ scale: 2.2 });
-    const canvas = document.createElement('canvas');
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    const ctx = canvas.getContext('2d');
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    const dataUrl = canvas.toDataURL(mime, 0.92);
-    const blob = await (await fetch(dataUrl)).blob();
-    return { blob, filename: `pagina.${ext}` };
-  }
-
-  const zip = new JSZip();
   for (let i = 1; i <= pdf.numPages; i++) {
     onProgress?.(`Exportando página ${i} de ${pdf.numPages}…`);
     const page = await pdf.getPage(i);
@@ -166,11 +228,11 @@ async function pdfToImages(files, onProgress, format = 'png') {
     const ctx = canvas.getContext('2d');
     await page.render({ canvasContext: ctx, viewport }).promise;
     const dataUrl = canvas.toDataURL(mime, 0.92);
-    zip.file(`pagina-${String(i).padStart(2, '0')}.${ext}`, dataUrl.split(',')[1], { base64: true });
+    const blob = await (await fetch(dataUrl)).blob();
+    const filename = pdf.numPages === 1 ? `pagina.${ext}` : `pagina-${String(i).padStart(2, '0')}.${ext}`;
+    results.push({ blob, filename });
   }
-  onProgress?.('Comprimiendo en ZIP…');
-  const blob = await zip.generateAsync({ type: 'blob' });
-  return { blob, filename: `paginas.zip` };
+  return results; // siempre imágenes individuales, nunca un .zip
 }
 
 async function wordToPdf(files, onProgress) {
@@ -263,14 +325,6 @@ const TOOLS = [
     accept: 'application/pdf',
     multiple: false,
     formatChoice: true,
-    run: async (files, onProgress, opts) => {
-      const { blob, filename } = await pdfToImages(files, onProgress, opts.format);
-      return blob;
-      // filename handled via closure below
-    },
-    outputName: () => `paginas-${Date.now()}`,
-    outputMime: 'application/octet-stream',
-    dynamicOutput: true,
   },
   {
     id: 'word2pdf',
@@ -453,13 +507,7 @@ function renderPickStep() {
   $('#pickFiles').addEventListener('click', () => fileInput.click());
 
   if (tool.camera) {
-    const camInput = document.createElement('input');
-    camInput.type = 'file';
-    camInput.accept = 'image/*';
-    camInput.capture = 'environment';
-    camInput.addEventListener('change', (e) => handleFiles(Array.from(e.target.files)));
-    document.body.appendChild(camInput);
-    $('#pickCamera').addEventListener('click', () => camInput.click());
+    $('#pickCamera').addEventListener('click', () => openScanner());
   }
 
   if (tool.formatChoice) {
@@ -581,6 +629,60 @@ function renderResultStep(blob, filename) {
   });
 }
 
+function renderResultStepMultiple(items) {
+  const withUrls = items.map((it) => ({ ...it, url: URL.createObjectURL(it.blob) }));
+  const rowsHtml = withUrls.map((it, idx) => `
+    <div class="file-row">
+      <div class="thumb icon">${icon('pdf2img')}</div>
+      <div class="info">
+        <div class="n">${it.filename}</div>
+        <div class="s">${bytesToSize(it.blob.size)}</div>
+      </div>
+      <a class="recent-dl" href="${it.url}" download="${it.filename}" data-idx="${idx}">${icon('download')}</a>
+    </div>
+  `).join('');
+
+  sheetContent.innerHTML = `
+    <div class="sheet-head">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <div class="tool-icon">${icon(state.currentTool.icon)}</div>
+        <div class="sheet-title"><h3>${state.currentTool.title}</h3><p>${withUrls.length} imagen${withUrls.length > 1 ? 'es' : ''} lista${withUrls.length > 1 ? 's' : ''}</p></div>
+      </div>
+      <button class="sheet-close" id="sheetCloseBtn">${icon('x')}</button>
+    </div>
+    <div class="sheet-body">
+      <div class="file-list">${rowsHtml}</div>
+      ${withUrls.length > 1 ? `<button class="primary-btn" id="dlAllBtn">${icon('download')}Descargar todas</button>` : ''}
+      <button class="ghost-btn" id="doneBtn">Hecho</button>
+    </div>
+  `;
+  $('#sheetCloseBtn').addEventListener('click', closeSheet);
+  $('#doneBtn').addEventListener('click', closeSheet);
+
+  $$('.recent-dl', sheetContent).forEach((a, idx) => {
+    a.addEventListener('click', () => {
+      addRecent({ name: withUrls[idx].filename, size: withUrls[idx].blob.size, url: withUrls[idx].url, tool: state.currentTool });
+      showToast('Guardado en Recientes');
+    });
+  });
+
+  const dlAllBtn = $('#dlAllBtn');
+  if (dlAllBtn) {
+    dlAllBtn.addEventListener('click', () => {
+      withUrls.forEach((it, i) => {
+        setTimeout(() => {
+          const a = document.createElement('a');
+          a.href = it.url;
+          a.download = it.filename;
+          a.click();
+        }, i * 300);
+      });
+      withUrls.forEach((it) => addRecent({ name: it.filename, size: it.blob.size, url: it.url, tool: state.currentTool }));
+      showToast('Guardado en Recientes');
+    });
+  }
+}
+
 function renderErrorStep(err) {
   console.error(err);
   sheetContent.innerHTML = `
@@ -604,15 +706,13 @@ async function runConversion() {
     if (p) p.textContent = msg;
   };
   try {
-    let blob, filename;
     if (tool.id === 'pdf2img') {
-      const res = await pdfToImages(state.selectedFiles, onProgress, state.format);
-      blob = res.blob;
-      filename = res.filename;
-    } else {
-      blob = await tool.run(state.selectedFiles, onProgress, { quality: state.quality, format: state.format });
-      filename = tool.outputName();
+      const results = await pdfToImages(state.selectedFiles, onProgress, state.format);
+      renderResultStepMultiple(results);
+      return;
     }
+    const blob = await tool.run(state.selectedFiles, onProgress, { quality: state.quality, format: state.format });
+    const filename = tool.outputName();
     renderResultStep(blob, filename);
   } catch (err) {
     renderErrorStep(err);
@@ -620,8 +720,132 @@ async function runConversion() {
 }
 
 /* =========================================================
-   RECIENTES
+   ESCÁNER CON MARCO GUÍA — cámara en vivo con overlay en
+   forma de documento; al capturar, recorta justo esa zona
    ========================================================= */
+let scannerStream = null;
+let scannerPageCount = 0;
+
+function buildScannerDom() {
+  const wrap = document.createElement('div');
+  wrap.id = 'scannerOverlay';
+  wrap.className = 'scanner-overlay';
+  wrap.innerHTML = `
+    <video id="scannerVideo" autoplay playsinline muted></video>
+    <div class="scanner-frame" id="scannerFrame">
+      <span class="corner tl"></span><span class="corner tr"></span>
+      <span class="corner bl"></span><span class="corner br"></span>
+    </div>
+    <div class="scanner-top">
+      <button class="icon-btn glass" id="scannerCancel">${icon('x')}</button>
+      <div class="scanner-hint glass">Alinea el documento dentro del marco</div>
+      <div style="width:42px;"></div>
+    </div>
+    <div class="scanner-bottom">
+      <div class="scanner-count" id="scannerCount">0 páginas</div>
+      <button class="scanner-shutter" id="scannerShutter" aria-label="Capturar"></button>
+      <button class="scanner-done glass" id="scannerDone">Listo</button>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  return wrap;
+}
+
+async function openScanner() {
+  scannerPageCount = 0;
+  const wrap = buildScannerDom();
+  const video = $('#scannerVideo', wrap);
+
+  try {
+    scannerStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+    video.srcObject = scannerStream;
+  } catch (err) {
+    // sin permiso de cámara o no soportado: usamos el selector nativo como respaldo
+    closeScanner();
+    const fallback = document.createElement('input');
+    fallback.type = 'file';
+    fallback.accept = 'image/*';
+    fallback.capture = 'environment';
+    fallback.addEventListener('change', (e) => handleFiles(Array.from(e.target.files)));
+    document.body.appendChild(fallback);
+    fallback.click();
+    showToast('No se pudo abrir la cámara, usa el selector nativo');
+    return;
+  }
+
+  document.body.style.overflow = 'hidden';
+  requestAnimationFrame(() => wrap.classList.add('is-open'));
+
+  $('#scannerCancel', wrap).addEventListener('click', closeScanner);
+  $('#scannerDone', wrap).addEventListener('click', () => {
+    closeScanner();
+    renderFileList();
+  });
+  $('#scannerShutter', wrap).addEventListener('click', () => captureScannerFrame(wrap));
+}
+
+function closeScanner() {
+  const wrap = $('#scannerOverlay');
+  if (scannerStream) {
+    scannerStream.getTracks().forEach((t) => t.stop());
+    scannerStream = null;
+  }
+  if (wrap) {
+    wrap.classList.remove('is-open');
+    setTimeout(() => wrap.remove(), 260);
+  }
+  document.body.style.overflow = '';
+}
+
+function captureScannerFrame(wrap) {
+  const video = $('#scannerVideo', wrap);
+  const frame = $('#scannerFrame', wrap);
+  if (!video.videoWidth) return;
+
+  const videoBox = video.getBoundingClientRect();
+  const frameBox = frame.getBoundingClientRect();
+
+  // el <video> se muestra con object-fit:cover; calculamos el recorte real
+  // en píxeles nativos que corresponde al área marcada por el marco guía
+  const nativeW = video.videoWidth;
+  const nativeH = video.videoHeight;
+  const coverScale = Math.max(videoBox.width / nativeW, videoBox.height / nativeH);
+  const renderW = nativeW * coverScale;
+  const renderH = nativeH * coverScale;
+  const offsetX = (videoBox.width - renderW) / 2;
+  const offsetY = (videoBox.height - renderH) / 2;
+
+  const sx = (frameBox.left - videoBox.left - offsetX) / coverScale;
+  const sy = (frameBox.top - videoBox.top - offsetY) / coverScale;
+  const sw = frameBox.width / coverScale;
+  const sh = frameBox.height / coverScale;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.round(sw);
+  canvas.height = Math.round(sh);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+
+  canvas.toBlob((blob) => {
+    scannerPageCount += 1;
+    const countEl = $('#scannerCount');
+    if (countEl) countEl.textContent = `${scannerPageCount} página${scannerPageCount > 1 ? 's' : ''}`;
+    const file = new File([blob], `escaneo-${Date.now()}.jpg`, { type: 'image/jpeg' });
+    handleFiles([file]);
+    flashScanner(wrap);
+  }, 'image/jpeg', 0.92);
+}
+
+function flashScanner(wrap) {
+  const f = document.createElement('div');
+  f.className = 'scanner-flash';
+  wrap.appendChild(f);
+  requestAnimationFrame(() => { f.style.opacity = '0'; });
+  setTimeout(() => f.remove(), 260);
+}
 const recentList = $('#recentList');
 function renderRecent() {
   if (state.recent.length === 0) {
