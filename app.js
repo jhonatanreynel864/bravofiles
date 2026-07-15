@@ -811,6 +811,10 @@ function buildScannerDom() {
   wrap.className = 'scanner-overlay';
   wrap.innerHTML = `
     <video id="scannerVideo" autoplay playsinline muted></video>
+    <div class="scanner-mask-bar" id="maskTop"></div>
+    <div class="scanner-mask-bar" id="maskBottom"></div>
+    <div class="scanner-mask-bar" id="maskLeft"></div>
+    <div class="scanner-mask-bar" id="maskRight"></div>
     <div class="scanner-frame" id="scannerFrame">
       <span class="corner tl"></span><span class="corner tr"></span>
       <span class="corner bl"></span><span class="corner br"></span>
@@ -828,6 +832,46 @@ function buildScannerDom() {
   `;
   document.body.appendChild(wrap);
   return wrap;
+}
+
+function defaultFrameTarget(wrap) {
+  const contBox = wrap.getBoundingClientRect();
+  const fw = contBox.width * 0.84;
+  const fh = Math.min(contBox.height * 0.64, fw * 1.414);
+  return {
+    left: (contBox.width - fw) / 2,
+    top: contBox.height * 0.16,
+    width: fw,
+    height: fh,
+    contW: contBox.width,
+    contH: contBox.height,
+  };
+}
+
+function positionFrameAndMask(wrap, target) {
+  const frameEl = $('#scannerFrame', wrap);
+  if (!frameEl) return;
+  const { left, top, width, height } = target;
+  const contW = target.contW ?? wrap.getBoundingClientRect().width;
+  const contH = target.contH ?? wrap.getBoundingClientRect().height;
+
+  frameEl.style.left = `${left}px`;
+  frameEl.style.top = `${top}px`;
+  frameEl.style.width = `${width}px`;
+  frameEl.style.height = `${height}px`;
+  frameEl.style.right = 'auto';
+  frameEl.style.margin = '0';
+  frameEl.style.maxHeight = 'none';
+  frameEl.style.aspectRatio = 'auto';
+
+  const maskTop = $('#maskTop', wrap);
+  const maskBottom = $('#maskBottom', wrap);
+  const maskLeft = $('#maskLeft', wrap);
+  const maskRight = $('#maskRight', wrap);
+  if (maskTop) { maskTop.style.left = '0'; maskTop.style.top = '0'; maskTop.style.width = '100%'; maskTop.style.height = `${Math.max(0, top)}px`; }
+  if (maskBottom) { maskBottom.style.left = '0'; maskBottom.style.top = `${top + height}px`; maskBottom.style.width = '100%'; maskBottom.style.height = `${Math.max(0, contH - (top + height))}px`; }
+  if (maskLeft) { maskLeft.style.left = '0'; maskLeft.style.top = `${top}px`; maskLeft.style.width = `${Math.max(0, left)}px`; maskLeft.style.height = `${height}px`; }
+  if (maskRight) { maskRight.style.left = `${left + width}px`; maskRight.style.top = `${top}px`; maskRight.style.width = `${Math.max(0, contW - (left + width))}px`; maskRight.style.height = `${height}px`; }
 }
 
 async function openScanner() {
@@ -856,7 +900,10 @@ async function openScanner() {
   }
 
   document.body.style.overflow = 'hidden';
-  requestAnimationFrame(() => wrap.classList.add('is-open'));
+  requestAnimationFrame(() => {
+    wrap.classList.add('is-open');
+    positionFrameAndMask(wrap, defaultFrameTarget(wrap)); // marco visible de inmediato, no espera a la detección
+  });
 
   $('#scannerCancel', wrap).addEventListener('click', closeScanner);
   $('#scannerDone', wrap).addEventListener('click', () => {
@@ -1012,60 +1059,55 @@ function detectDocumentRect(video) {
 
 function startAutoFrame(wrap) {
   const video = $('#scannerVideo', wrap);
-  const frameEl = $('#scannerFrame', wrap);
   scannerFrameState = null;
   scannerGoodTicksLeft = 0;
   scannerLastGoodTarget = null;
 
   scannerDetectTimer = setInterval(() => {
-    const contBox = wrap.getBoundingClientRect();
-    const nativeW = video.videoWidth, nativeH = video.videoHeight;
-    if (!nativeW || !nativeH) return;
+    try {
+      const contBox = wrap.getBoundingClientRect();
+      const nativeW = video.videoWidth, nativeH = video.videoHeight;
+      if (!nativeW || !nativeH) return;
 
-    const coverScale = Math.max(contBox.width / nativeW, contBox.height / nativeH);
-    const offsetX = (contBox.width - nativeW * coverScale) / 2;
-    const offsetY = (contBox.height - nativeH * coverScale) / 2;
+      const coverScale = Math.max(contBox.width / nativeW, contBox.height / nativeH);
+      const offsetX = (contBox.width - nativeW * coverScale) / 2;
+      const offsetY = (contBox.height - nativeH * coverScale) / 2;
 
-    const det = detectDocumentRect(video);
-    let target;
-    if (det) {
-      target = {
-        left: offsetX + det.x * nativeW * coverScale,
-        top: offsetY + det.y * nativeH * coverScale,
-        width: det.w * nativeW * coverScale,
-        height: det.h * nativeH * coverScale,
-      };
-      scannerLastGoodTarget = target;
-      scannerGoodTicksLeft = 6; // mantiene la última posición buena unos instantes si se pierde el tracking
-    } else if (scannerGoodTicksLeft > 0 && scannerLastGoodTarget) {
-      target = scannerLastGoodTarget;
-      scannerGoodTicksLeft--;
-    } else {
-      const fw = contBox.width * 0.84;
-      const fh = Math.min(contBox.height * 0.64, fw * 1.414);
-      target = {
-        left: (contBox.width - fw) / 2,
-        top: contBox.height * 0.16,
-        width: fw,
-        height: fh,
-      };
+      let det = null;
+      try { det = detectDocumentRect(video); } catch (e) { det = null; }
+
+      let target;
+      if (det) {
+        target = {
+          left: offsetX + det.x * nativeW * coverScale,
+          top: offsetY + det.y * nativeH * coverScale,
+          width: det.w * nativeW * coverScale,
+          height: det.h * nativeH * coverScale,
+        };
+        scannerLastGoodTarget = target;
+        scannerGoodTicksLeft = 6; // mantiene la última posición buena unos instantes si se pierde el tracking
+      } else if (scannerGoodTicksLeft > 0 && scannerLastGoodTarget) {
+        target = scannerLastGoodTarget;
+        scannerGoodTicksLeft--;
+      } else {
+        target = defaultFrameTarget(wrap);
+      }
+      target.contW = contBox.width;
+      target.contH = contBox.height;
+
+      if (!scannerFrameState) scannerFrameState = { ...target };
+      const L = 0.32;
+      scannerFrameState.left += (target.left - scannerFrameState.left) * L;
+      scannerFrameState.top += (target.top - scannerFrameState.top) * L;
+      scannerFrameState.width += (target.width - scannerFrameState.width) * L;
+      scannerFrameState.height += (target.height - scannerFrameState.height) * L;
+      scannerFrameState.contW = contBox.width;
+      scannerFrameState.contH = contBox.height;
+
+      positionFrameAndMask(wrap, scannerFrameState);
+    } catch (e) {
+      /* nunca dejar que un error de detección rompa el escáner */
     }
-
-    if (!scannerFrameState) scannerFrameState = { ...target };
-    const L = 0.32;
-    scannerFrameState.left += (target.left - scannerFrameState.left) * L;
-    scannerFrameState.top += (target.top - scannerFrameState.top) * L;
-    scannerFrameState.width += (target.width - scannerFrameState.width) * L;
-    scannerFrameState.height += (target.height - scannerFrameState.height) * L;
-
-    frameEl.style.left = `${scannerFrameState.left}px`;
-    frameEl.style.top = `${scannerFrameState.top}px`;
-    frameEl.style.width = `${scannerFrameState.width}px`;
-    frameEl.style.height = `${scannerFrameState.height}px`;
-    frameEl.style.right = 'auto';
-    frameEl.style.margin = '0';
-    frameEl.style.maxHeight = 'none';
-    frameEl.style.aspectRatio = 'auto';
   }, 220);
 }
 
