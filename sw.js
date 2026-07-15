@@ -1,4 +1,4 @@
-const CACHE = 'bravofiles-v2';
+const CACHE = 'bravofiles-v3';
 const SHELL = [
   './',
   './index.html',

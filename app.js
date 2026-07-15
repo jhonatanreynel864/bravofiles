@@ -883,19 +883,92 @@ function closeScanner() {
 }
 
 /* ---- auto-ajuste del marco al tamaño real del documento ----
-   Se analiza el video en vivo a baja resolución buscando la zona
-   clara y rectangular (la hoja) y el marco se anima hacia ese
-   tamaño; si no encuentra nada confiable, usa un marco por defecto. */
+   Se analiza el video en vivo a baja resolución: se calcula un umbral
+   que se adapta a la luz de cada escena (método de Otsu) y se busca
+   la región conexa más grande con forma de hoja (probando tanto
+   "documento claro sobre fondo oscuro" como al revés). Si no hay
+   nada confiable, se usa un marco por defecto centrado. */
 let scannerDetectTimer = null;
 let scannerFrameState = null;
 let scannerDetectCanvas = null;
+let scannerGoodTicksLeft = 0;
+let scannerLastGoodTarget = null;
+
+function otsuThreshold(hist, total) {
+  let sum = 0;
+  for (let t = 0; t < 256; t++) sum += t * hist[t];
+  let sumB = 0, wB = 0, best = 0, bestVar = -1;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > bestVar) { bestVar = between; best = t; }
+  }
+  return best;
+}
+
+/* componente conexa más grande dentro de una máscara binaria (BFS con pila) */
+function largestComponent(bin, w, h, visited, stack) {
+  visited.fill(0);
+  let best = null;
+  const n = w * h;
+  for (let start = 0; start < n; start++) {
+    if (bin[start] !== 1 || visited[start]) continue;
+    let sp = 0;
+    stack[sp++] = start;
+    visited[start] = 1;
+    let count = 0, minX = w, maxX = 0, minY = h, maxY = 0;
+    while (sp > 0) {
+      const idx = stack[--sp];
+      const x = idx % w, y = (idx / w) | 0;
+      count++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+      if (x > 0 && bin[idx - 1] === 1 && !visited[idx - 1]) { visited[idx - 1] = 1; stack[sp++] = idx - 1; }
+      if (x < w - 1 && bin[idx + 1] === 1 && !visited[idx + 1]) { visited[idx + 1] = 1; stack[sp++] = idx + 1; }
+      if (y > 0 && bin[idx - w] === 1 && !visited[idx - w]) { visited[idx - w] = 1; stack[sp++] = idx - w; }
+      if (y < h - 1 && bin[idx + w] === 1 && !visited[idx + w]) { visited[idx + w] = 1; stack[sp++] = idx + w; }
+    }
+    const bboxW = maxX - minX + 1, bboxH = maxY - minY + 1;
+    const area = bboxW * bboxH;
+    if (!best || count > best.count) best = { count, minX, minY, maxX, maxY, bboxW, bboxH, area };
+  }
+  return best;
+}
+
+function scoreCandidate(cand, procW, procH) {
+  if (!cand) return null;
+  const frameArea = procW * procH;
+  const areaRatio = cand.area / frameArea;
+  const fillRatio = cand.count / cand.area;
+  const aspect = cand.bboxW / cand.bboxH;
+  if (areaRatio < 0.10 || areaRatio > 0.94) return null;
+  if (fillRatio < 0.5) return null;
+  if (aspect < 0.35 || aspect > 2.8) return null;
+  // si ocupa casi todo el cuadro por los 4 lados, probablemente es el fondo, no una hoja
+  if (cand.minX <= 1 && cand.maxX >= procW - 2 && cand.minY <= 1 && cand.maxY >= procH - 2) return null;
+
+  const cx = (cand.minX + cand.maxX) / 2 / procW;
+  const cy = (cand.minY + cand.maxY) / 2 / procH;
+  const centerDist = Math.hypot(cx - 0.5, cy - 0.5);
+  const score = fillRatio * 0.5 + (1 - Math.min(1, centerDist * 1.4)) * 0.5;
+  return { rect: { x: cand.minX / procW, y: cand.minY / procH, w: cand.bboxW / procW, h: cand.bboxH / procH }, score };
+}
 
 function detectDocumentRect(video) {
   const nativeW = video.videoWidth, nativeH = video.videoHeight;
   if (!nativeW || !nativeH) return null;
 
-  const procW = 160;
+  const procW = 150;
   const procH = Math.max(1, Math.round((procW * nativeH) / nativeW));
+  const n = procW * procH;
   if (!scannerDetectCanvas) scannerDetectCanvas = document.createElement('canvas');
   scannerDetectCanvas.width = procW;
   scannerDetectCanvas.height = procH;
@@ -907,35 +980,42 @@ function detectDocumentRect(video) {
     data = ctx.getImageData(0, 0, procW, procH).data;
   } catch (e) { return null; }
 
-  const colSum = new Float32Array(procW);
-  const rowSum = new Float32Array(procH);
-  for (let y = 0; y < procH; y++) {
-    for (let x = 0; x < procW; x++) {
-      const i = (y * procW + x) * 4;
-      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      if (lum > 165) { colSum[x] += 1; rowSum[y] += 1; }
-    }
+  const lum = new Uint8ClampedArray(n);
+  const hist = new Uint32Array(256);
+  for (let p = 0, i = 0; p < n; p++, i += 4) {
+    const l = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) | 0;
+    lum[p] = l;
+    hist[l]++;
+  }
+  const threshold = otsuThreshold(hist, n);
+
+  const bright = new Uint8Array(n);
+  const dark = new Uint8Array(n);
+  for (let p = 0; p < n; p++) {
+    const isBright = lum[p] > threshold ? 1 : 0;
+    bright[p] = isBright;
+    dark[p] = isBright ? 0 : 1;
   }
 
-  const colThresh = procH * 0.35;
-  const rowThresh = procW * 0.35;
-  let left = -1, right = -1, top = -1, bottom = -1;
-  for (let x = 0; x < procW; x++) if (colSum[x] > colThresh) { left = x; break; }
-  for (let x = procW - 1; x >= 0; x--) if (colSum[x] > colThresh) { right = x; break; }
-  for (let y = 0; y < procH; y++) if (rowSum[y] > rowThresh) { top = y; break; }
-  for (let y = procH - 1; y >= 0; y--) if (rowSum[y] > rowThresh) { bottom = y; break; }
+  const visited = new Uint8Array(n);
+  const stack = new Int32Array(n);
 
-  if (left < 0 || right < 0 || top < 0 || bottom < 0) return null;
-  const w = right - left, h = bottom - top;
-  if (w < procW * 0.22 || h < procH * 0.22) return null; // muy chico, poca confianza
+  const candBright = scoreCandidate(largestComponent(bright, procW, procH, visited, stack), procW, procH);
+  const candDark = scoreCandidate(largestComponent(dark, procW, procH, visited, stack), procW, procH);
 
-  return { x: left / procW, y: top / procH, w: w / procW, h: h / procH };
+  let winner = null;
+  if (candBright && candDark) winner = candBright.score >= candDark.score ? candBright : candDark;
+  else winner = candBright || candDark;
+
+  return winner ? winner.rect : null;
 }
 
 function startAutoFrame(wrap) {
   const video = $('#scannerVideo', wrap);
   const frameEl = $('#scannerFrame', wrap);
   scannerFrameState = null;
+  scannerGoodTicksLeft = 0;
+  scannerLastGoodTarget = null;
 
   scannerDetectTimer = setInterval(() => {
     const contBox = wrap.getBoundingClientRect();
@@ -955,6 +1035,11 @@ function startAutoFrame(wrap) {
         width: det.w * nativeW * coverScale,
         height: det.h * nativeH * coverScale,
       };
+      scannerLastGoodTarget = target;
+      scannerGoodTicksLeft = 6; // mantiene la última posición buena unos instantes si se pierde el tracking
+    } else if (scannerGoodTicksLeft > 0 && scannerLastGoodTarget) {
+      target = scannerLastGoodTarget;
+      scannerGoodTicksLeft--;
     } else {
       const fw = contBox.width * 0.84;
       const fh = Math.min(contBox.height * 0.64, fw * 1.414);
@@ -967,7 +1052,7 @@ function startAutoFrame(wrap) {
     }
 
     if (!scannerFrameState) scannerFrameState = { ...target };
-    const L = 0.3;
+    const L = 0.32;
     scannerFrameState.left += (target.left - scannerFrameState.left) * L;
     scannerFrameState.top += (target.top - scannerFrameState.top) * L;
     scannerFrameState.width += (target.width - scannerFrameState.width) * L;
@@ -990,6 +1075,7 @@ function stopAutoFrame() {
     scannerDetectTimer = null;
   }
   scannerFrameState = null;
+  scannerLastGoodTarget = null;
 }
 
 function captureScannerFrame(wrap) {
