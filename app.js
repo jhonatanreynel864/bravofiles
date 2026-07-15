@@ -818,10 +818,14 @@ function buildScannerDom() {
     <div class="scanner-frame" id="scannerFrame">
       <span class="corner tl"></span><span class="corner tr"></span>
       <span class="corner bl"></span><span class="corner br"></span>
+      <span class="handle" data-handle="tl"></span>
+      <span class="handle" data-handle="tr"></span>
+      <span class="handle" data-handle="bl"></span>
+      <span class="handle" data-handle="br"></span>
     </div>
     <div class="scanner-top">
       <button class="icon-btn glass" id="scannerCancel">${icon('x')}</button>
-      <div class="scanner-hint glass">Alinea el documento dentro del marco</div>
+      <div class="scanner-hint glass" id="scannerHint">Alinea el documento y ajusta las esquinas si hace falta</div>
       <div style="width:42px;"></div>
     </div>
     <div class="scanner-bottom">
@@ -832,6 +836,79 @@ function buildScannerDom() {
   `;
   document.body.appendChild(wrap);
   return wrap;
+}
+
+let scannerManualMode = false;
+
+function attachFrameDragHandlers(wrap) {
+  const frameEl = $('#scannerFrame', wrap);
+  let dragMode = null;
+  let startPointer = { x: 0, y: 0 };
+  let startRect = null;
+  const MIN_SIZE = 70;
+
+  function currentRect() {
+    const s = scannerFrameState;
+    if (s) return { left: s.left, top: s.top, width: s.width, height: s.height };
+    const b = frameEl.getBoundingClientRect();
+    const wb = wrap.getBoundingClientRect();
+    return { left: b.left - wb.left, top: b.top - wb.top, width: b.width, height: b.height };
+  }
+
+  function onPointerMove(e) {
+    if (!dragMode) return;
+    const dx = e.clientX - startPointer.x;
+    const dy = e.clientY - startPointer.y;
+    let { left, top, width, height } = startRect;
+
+    if (dragMode === 'move') {
+      left = startRect.left + dx;
+      top = startRect.top + dy;
+    } else {
+      if (dragMode.includes('l')) { left = startRect.left + dx; width = startRect.width - dx; }
+      if (dragMode.includes('r')) { width = startRect.width + dx; }
+      if (dragMode.includes('t')) { top = startRect.top + dy; height = startRect.height - dy; }
+      if (dragMode.includes('b')) { height = startRect.height + dy; }
+      if (width < MIN_SIZE) { if (dragMode.includes('l')) left = startRect.left + startRect.width - MIN_SIZE; width = MIN_SIZE; }
+      if (height < MIN_SIZE) { if (dragMode.includes('t')) top = startRect.top + startRect.height - MIN_SIZE; height = MIN_SIZE; }
+    }
+
+    const contBox = wrap.getBoundingClientRect();
+    left = Math.max(0, Math.min(left, contBox.width - MIN_SIZE));
+    top = Math.max(0, Math.min(top, contBox.height - MIN_SIZE));
+    width = Math.min(width, contBox.width - left);
+    height = Math.min(height, contBox.height - top);
+
+    scannerFrameState = { left, top, width, height, contW: contBox.width, contH: contBox.height };
+    positionFrameAndMask(wrap, scannerFrameState);
+  }
+
+  function onPointerUp() {
+    dragMode = null;
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('pointerup', onPointerUp);
+  }
+
+  function onPointerDown(e, mode) {
+    e.preventDefault();
+    e.stopPropagation();
+    scannerManualMode = true;
+    const hint = $('#scannerHint', wrap);
+    if (hint) hint.textContent = 'Ajusta el marco con el dedo';
+    dragMode = mode;
+    startPointer = { x: e.clientX, y: e.clientY };
+    startRect = currentRect();
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerUp);
+  }
+
+  $$('.handle', frameEl).forEach((h) => {
+    h.addEventListener('pointerdown', (e) => onPointerDown(e, h.dataset.handle));
+  });
+  frameEl.addEventListener('pointerdown', (e) => {
+    if (e.target.classList.contains('handle')) return;
+    onPointerDown(e, 'move');
+  });
 }
 
 function defaultFrameTarget(wrap) {
@@ -904,6 +981,9 @@ async function openScanner() {
     wrap.classList.add('is-open');
     positionFrameAndMask(wrap, defaultFrameTarget(wrap)); // marco visible de inmediato, no espera a la detección
   });
+
+  scannerManualMode = false;
+  attachFrameDragHandlers(wrap);
 
   $('#scannerCancel', wrap).addEventListener('click', closeScanner);
   $('#scannerDone', wrap).addEventListener('click', () => {
@@ -1064,6 +1144,7 @@ function startAutoFrame(wrap) {
   scannerLastGoodTarget = null;
 
   scannerDetectTimer = setInterval(() => {
+    if (scannerManualMode) return; // el usuario está ajustando el marco a mano, no lo pisamos
     try {
       const contBox = wrap.getBoundingClientRect();
       const nativeW = video.videoWidth, nativeH = video.videoHeight;
